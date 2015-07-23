@@ -25,6 +25,13 @@ local co_create = coroutine.create
 local co_status = coroutine.status
 local co_resume = coroutine.resume
 
+local expect_continue = function(value)
+    if value and str_lower(value) == "100-continue" then 
+        return true
+    else
+        return false
+    end
+end
 
 -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
 local HOP_BY_HOP_HEADERS = {
@@ -253,7 +260,10 @@ local function _receive_status(sock)
         return nil, nil, err
     end
 
-    return tonumber(str_sub(line, 10, 12)), tonumber(str_sub(line, 6, 8))
+    local status = tonumber(str_sub(line, 10, 12))
+    local version = tonumber(str_sub(line, 6, 8))
+    if not status or not version then return nil,nil,"cant sub response status and version from line:"..tostring(line) end
+    return status,version
 end
 
 
@@ -477,16 +487,25 @@ end
 local function _handle_continue(sock, body)
     local status, version, err = _receive_status(sock)
     if not status then
-        return nil, err
+        return nil,nil, err
     end
 
     -- Only send body if we receive a 100 Continue
     if status == 100 then
-        local ok, err = sock:receive("*l") -- Read carriage return
-        if not ok then
-            return nil, err
+        -- bug fix,100 continue response maybe include status_line and some optional headers, and is terminated by an empty line
+        -- see http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.1
+
+        --local ok, err = sock:receive("*l") -- Read carriage return
+        --if not ok then
+        --    return nil,nil, err
+        --end
+
+        local continue_headers,err = _receive_headers(sock)
+        if not continue_headers then
+            return nil,nil, err
         end
-        _send_body(sock, body)
+        -- the if condition is used for 100-continue response come back without Expect: 100-continue header in request via http/1.1
+        if body then _send_body(sock, body) end
     end
     return status, version, err
 end
@@ -505,7 +524,13 @@ function _M.send_request(self, params)
         -- We assign one by one so that the metatable can handle case insensitivity
         -- for us. You can blame the spec for this inefficiency.
         for k,v in pairs(params_headers) do
-            headers[k] = v
+            -- if body is string,we need to ignore "Transfer-Encoding: chunked"
+            -- Chunked request body is not yet supported by ngx_lua
+            -- also see _M.get_client_body_reader
+            if type(body) ~= 'string' then headers[k] = v
+            elseif str_lower(k) ~= 'transfer-encoding' then headers[k] = v
+            elseif str_lower(v) ~= 'chunked' then headers[k] = v
+            end
         end
     end
     
@@ -536,7 +561,7 @@ function _M.send_request(self, params)
 
     -- Send the request body, unless we expect: continue, in which case
     -- we handle this as part of reading the response.
-    if headers["Expect"] ~= "100-continue" then
+    if not expect_continue(headers["Expect"]) then
         local ok, err, partial = _send_body(sock, body)
         if not ok then
             return nil, err, partial
@@ -552,15 +577,29 @@ function _M.read_response(self, params)
 
     local status, version, err
 
+    -- scene 1:
     -- If we expect: continue, we need to handle this, sending the body if allowed.
     -- If we don't get 100 back, then status is the actual status.
-    if params.headers["Expect"] == "100-continue" then
-        local _status, _version, _err = _handle_continue(sock, params.body)
-        if not _status then
-            return nil, _err
-        elseif _status ~= 100 then
-            status, version, err = _status, _version, _err
-        end
+    -- scene 2:
+    -- As of now nginx doesn't know how to handle 1xx informational
+    -- responses, and it always removes Expect from a requests sent to backends.
+    -- but lua-resty-http will also pass it to backends.
+    -- and RFC 2616 say:
+    -- An origin server SHOULD NOT send a 100 (Continue) response if
+    -- the request message does not include an Expect request-header
+    -- field with the "100-continue" expectation, and MUST NOT send a
+    -- 100 (Continue) response if such a request comes from an HTTP/1.0
+    -- (or earlier) client.
+    -- see http://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html#sec8.2.3
+    
+    -- It's SHOULD NOT requirement,so it's maybe also receive 100 continue response without Expect: 100-continue request header.
+    -- we need to handle and silently drop it.
+    local request_body = (expect_continue(params.headers["Expect"]) and params.body) or nil
+    local _status, _version, _err = _handle_continue(sock, request_body)
+    if not _status then
+        return nil, _err
+    elseif _status ~= 100 then
+        status, version, err = _status, _version, _err
     end
 
     -- Just read the status as normal.
@@ -638,7 +677,7 @@ end
 
 function _M.request_pipeline(self, requests)
     for i, params in ipairs(requests) do
-        if params.headers and params.headers["Expect"] == "100-continue" then
+        if params.headers and expect_continue(params.headers["Expect"]) then
             return nil, "Cannot pipeline request specifying Expect: 100-continue"
         end
 
@@ -728,6 +767,29 @@ end
 
 function _M.get_client_body_reader(self, chunksize)
     local chunksize = chunksize or 65536
+
+    local headers = ngx_req_get_headers()
+    local length = headers.content_length
+    local encoding = headers.transfer_encoding
+
+    -- it's chunked request body scenario
+    -- ngx.req.socket is not support yet
+    -- so we use ngx.req.read_body to get it
+    if encoding and str_lower(encoding) == 'chunked' then
+        local request_body = nil
+        local request_body_err = nil
+        ngx.req.read_body()
+        request_body = ngx.req.get_body_data()
+        if not request_body then
+            local request_body_file = ngx.req.get_body_file()
+            if request_body_file then 
+                local fp = io.open(request_body_file,"r")
+                if fp then fp:seek("set",0) request_body = fp:read("*a") fp:close() end
+            end
+        end
+        if request_body then return request_body end
+    end
+
     local ok, sock, err = pcall(ngx_req_socket)
 
     if not ok then
@@ -742,9 +804,9 @@ function _M.get_client_body_reader(self, chunksize)
         end
     end
 
-    local headers = ngx_req_get_headers()
-    local length = headers.content_length
-    local encoding = headers.transfer_encoding
+--    local headers = ngx_req_get_headers()
+--    local length = headers.content_length
+--    local encoding = headers.transfer_encoding
     if length then
         return _body_reader(sock, tonumber(length), chunksize)
     elseif encoding and str_lower(encoding) == 'chunked' then
@@ -791,6 +853,11 @@ function _M.proxy_response(self, response, chunksize)
 
         if chunk then
             ngx.print(chunk)
+            --bugFix:
+            ----need to flush response output to the client immediately for streaming output scene,
+            ----otherwise,the connection will be closed abnormally by client
+            ----Reference¡êo http://wiki.nginx.org/HttpLuaModule#ngx.flush
+            ok,err = ngx.flush(true)
         end
     until not chunk
 end
