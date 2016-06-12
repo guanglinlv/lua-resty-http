@@ -74,7 +74,7 @@ end
 
 
 local _M = {
-    _VERSION = '0.06',
+    _VERSION = '0.08',
 }
 _M._USER_AGENT = "lua-resty-http/" .. _M._VERSION .. " (Lua) ngx_lua/" .. ngx.config.ngx_lua_version
 
@@ -118,6 +118,8 @@ function _M.ssl_handshake(self, ...)
         return nil, "not initialized"
     end
 
+    self.ssl = true
+
     return sock:sslhandshake(...)
 end
 
@@ -129,6 +131,13 @@ function _M.connect(self, ...)
     end
 
     self.host = select(1, ...)
+    self.port = select(2, ...)
+
+    -- If port is not a number, this is likely a unix domain socket connection.
+    if type(self.port) ~= "number" then
+        self.port = nil
+    end
+
     self.keepalive = true
 
     return sock:connect(...)
@@ -196,14 +205,16 @@ function _M.parse_uri(self, uri)
 
         return nil, "bad uri"
     else
-        if not m[3] then
+        if m[3] then
+            m[3] = tonumber(m[3])
+        else
             if m[1] == "https" then
                 m[3] = 443
             else
                 m[3] = 80
             end
         end
-        if not m[4] then m[4] = "/" end
+        if not m[4] or "" == m[4] then m[4] = "/" end
         return m, nil
     end
 end
@@ -257,13 +268,14 @@ end
 local function _receive_status(sock)
     local line, err = sock:receive("*l")
     if not line then
-        return nil, nil, err
+        return nil, nil, nil, err
     end
 
     local status = tonumber(str_sub(line, 10, 12))
     local version = tonumber(str_sub(line, 6, 8))
     if not status or not version then return nil,nil,"cant sub response status and version from line:"..tostring(line) end
-    return status,version
+    local reason = str_sub(line, 14)
+    return status,version,reason
 end
 
 
@@ -277,7 +289,7 @@ local function _receive_headers(sock)
             return nil, err
         end
 
-        for key, val in str_gmatch(line, "([^:]+):%s*(.+)") do
+        for key, val in str_gmatch(line, "([^:%s]+):%s*(.+)") do
             key = str_gsub(key, "^%s*(.-)%s*$","%1")
 	    val = str_gsub(val, "^%s*(.-)%s*$","%1")
             if headers[key] then
@@ -499,9 +511,9 @@ end
 
 
 local function _handle_continue(sock, body)
-    local status, version, err = _receive_status(sock)
+    local status, version, reason, err = _receive_status(sock)
     if not status then
-        return nil,nil, err
+        return nil,nil,nil, err
     end
 
     -- Only send body if we receive a 100 Continue
@@ -511,17 +523,17 @@ local function _handle_continue(sock, body)
 
         --local ok, err = sock:receive("*l") -- Read carriage return
         --if not ok then
-        --    return nil,nil, err
+        --    return nil,nil,nil, err
         --end
 
         local continue_headers,err = _receive_headers(sock)
         if not continue_headers then
-            return nil,nil, err
+            return nil,nil,nil, err
         end
         -- the if condition is used for 100-continue response come back without Expect: 100-continue header in request via http/1.1
         if body then _send_body(sock, body) end
     end
-    return status, version, err
+    return status, version,reason, err
 end
 
 
@@ -553,7 +565,22 @@ function _M.send_request(self, params)
         headers["Content-Length"] = #body
     end
     if not headers["Host"] then
-        headers["Host"] = self.host
+        if (str_sub(self.host, 1, 5) == "unix:") then
+            return nil, "Unable to generate a useful Host header for a unix domain socket. Please provide one."
+        end
+        -- If we have a port (i.e. not connected to a unix domain socket), and this
+        -- port is non-standard, append it to the Host heaer.
+        if self.port then
+            if self.ssl and self.port ~= 443 then
+                headers["Host"] = self.host .. ":" .. self.port
+            elseif not self.ssl and self.port ~= 80 then
+                headers["Host"] = self.host .. ":" .. self.port
+            else
+                headers["Host"] = self.host
+            end
+        else
+            headers["Host"] = self.host
+        end
     end
     if not headers["User-Agent"] then
         headers["User-Agent"] = _M._USER_AGENT
@@ -589,7 +616,7 @@ end
 function _M.read_response(self, params)
     local sock = self.sock
 
-    local status, version, err
+    local status, version, reason, err
 
     -- scene 1:
     -- If we expect: continue, we need to handle this, sending the body if allowed.
@@ -609,16 +636,16 @@ function _M.read_response(self, params)
     -- It's SHOULD NOT requirement,so it's maybe also receive 100 continue response without Expect: 100-continue request header.
     -- we need to handle and silently drop it.
     local request_body = (expect_continue(params.headers["Expect"]) and params.body) or nil
-    local _status, _version, _err = _handle_continue(sock, request_body)
+    local _status, _version, _reason, _err = _handle_continue(sock, request_body)
     if not _status then
         return nil, _err
     elseif _status ~= 100 then
-        status, version, err = _status, _version, _err
+        status, version, reason, err = _status, _version, _reason, _err
     end
 
     -- Just read the status as normal.
     if not status then
-        status, version, err = _receive_status(sock)
+        status, version, reason, err = _receive_status(sock)
         if not status then
             return nil, err
         end
@@ -630,11 +657,16 @@ function _M.read_response(self, params)
         return nil, err
     end
 
-    -- Determine if we should keepalive or not.
+    -- keepalive is true by default. Determine if this is correct or not.
     local ok, connection = pcall(str_lower, res_headers["Connection"])
     if ok then
         if  (version == 1.1 and connection == "close") or
             (version == 1.0 and connection ~= "keep-alive") then
+            self.keepalive = false
+        end
+    else
+        -- no connection header
+        if version == 1.0 then
             self.keepalive = false
         end
     end
@@ -668,6 +700,7 @@ function _M.read_response(self, params)
     else
         return {
             status = status,
+            reason = reason,
             headers = res_headers,
             has_body = has_body,
             body_reader = body_reader,
@@ -869,12 +902,11 @@ function _M.proxy_response(self, response, chunksize)
         end
 
         if chunk then
-            ngx.print(chunk)
-            --bugFix:
-            ----need to flush response output to the client immediately for streaming output scene,
-            ----otherwise,the connection will be closed abnormally by client
-            ----Reference¡êo http://wiki.nginx.org/HttpLuaModule#ngx.flush
-            ok,err = ngx.flush(true)
+            local res, err = ngx.print(chunk)
+            if not res then
+                ngx_log(ngx_ERR, err)
+                break
+            end
         end
     until not chunk
 end
